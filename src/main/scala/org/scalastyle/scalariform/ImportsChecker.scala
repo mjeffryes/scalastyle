@@ -30,6 +30,7 @@ import VisitorHelper.visit
 
 abstract class AbstractImportChecker extends ScalariformChecker {
   case class ImportClauseVisit(t: ImportClause, importExpr: List[ImportClauseVisit], otherImportExprs: List[ImportClauseVisit]);
+  case class Import(text: String, offset: Int);
 
   def verify(ast: CompilationUnit): List[ScalastyleError] = {
     init()
@@ -51,19 +52,19 @@ abstract class AbstractImportChecker extends ScalariformChecker {
     if (matches(t)) t :: l else l
   }
 
-  private[this] def imports(tokens: List[Token]): String = {
-    tokens.foldLeft("")((a, b) => a + b.text)
+  private[this] def imports(tokens: List[Token]): Import = {
+    Import(tokens.foldLeft("")((a, b) => a + b.text), tokens.headOption map { _.offset } getOrElse 0)
   }
 
-  private[this] def imports(t: BlockImportExpr): List[String] = {
+  private[this] def imports(t: BlockImportExpr): List[Import] = {
     val is = t.importSelectors
 
-    val firsts = is.firstImportSelector.firstToken.text ::
-            is.otherImportSelectors.map(_._2).map(is => is.firstToken.text)
-    firsts.map(f => imports(t.prefixExpr.tokens) + f)
+    val firsts = is.firstImportSelector.firstToken ::
+            is.otherImportSelectors.map(_._2).map(is => is.firstToken)
+    firsts.map(f => Import(imports(t.prefixExpr.tokens).text + f.text, f.offset))
   }
 
-  protected final def imports(t: ImportClauseVisit): List[String] = {
+  protected final def imports(t: ImportClauseVisit): List[Import] = {
     t.t.importExpr match {
       case t: BlockImportExpr => imports(t)
       case _ => List(imports(t.t.importExpr.tokens))
@@ -72,7 +73,7 @@ abstract class AbstractImportChecker extends ScalariformChecker {
 
   def matches(t: ImportClauseVisit): Boolean
 
-  private[this] def localvisit(ast: Any): List[ImportClauseVisit] = ast match {
+  protected[this] def localvisit(ast: Any): List[ImportClauseVisit] = ast match {
     case t: ImportClause => List(ImportClauseVisit(t, localvisit(t.importExpr), localvisit(t.otherImportExprs)))
     case t: Any => visit(t, localvisit)
   }
@@ -96,14 +97,14 @@ class IllegalImportsChecker extends AbstractImportChecker {
 
   def matches(t: ImportClauseVisit): Boolean = {
     val list = imports(t)
-    illegalImportsList.exists(ill => list.exists(_.startsWith(ill)))
+    illegalImportsList.exists(ill => list.exists(_.text.startsWith(ill)))
   }
 }
 
 class UnderscoreImportChecker extends AbstractImportChecker {
   val errorKey = "underscore.import"
 
-  def matches(t: ImportClauseVisit): Boolean = imports(t).exists(_.endsWith("._"))
+  def matches(t: ImportClauseVisit): Boolean = imports(t).exists(_.text.endsWith("._"))
 }
 
 class ImportGroupingChecker extends ScalariformChecker {
@@ -123,6 +124,47 @@ class ImportGroupingChecker extends ScalariformChecker {
       s match {
         case Some(x) => it.dropWhile(ic => ic.firstToken.offset <= x.offset).map(ic => PositionError(ic.firstToken.offset))
         case None => List()
+      }
+    }
+  }
+}
+
+class ImportSortingChecker extends AbstractImportChecker {
+  import scala.collection.immutable.WrappedString
+
+  val errorKey = "import.sorting"
+
+  private val maxSeparationOfConsecutiveImports = 10
+  private val camelWordRegex = "([A-Z][a-z]*|[0-9]*)".r
+
+  def matches(t: ImportClauseVisit): Boolean = false
+
+  def splitCamel(s: String) = {
+    val (pre, post) = s.span(c => c.isLower || c == '_' )
+    pre :: (camelWordRegex.findAllIn(post) filterNot { _ == "" } map { _.toLowerCase } toList)
+  }
+
+  def gt(x: Seq[String], y: Seq[String]): Boolean =
+    (x.zip(y) dropWhile { case (a, b) => a == b }).headOption map { case (a, b) =>
+      val aPre :: aPost = splitCamel(a)
+      val bPre :: bPost = splitCamel(b)
+      if (aPre == bPre) gt(aPost, bPost) else (aPre > bPre)
+    } getOrElse { x.length > y.length }
+
+  override def verify(ast: CompilationUnit): List[ScalastyleError] = {
+    val importList = localvisit(ast.immediateChildren) flatMap imports
+
+    if (importList.size == 0) {
+      List()
+    } else {
+      val importListNext = importList.tail
+      val importListPairs = importList zip importListNext
+
+      for {
+          (first, second) <- importListPairs if gt(first.text.split('.').toSeq, second.text.split('.').toSeq) &&
+          ((second.offset - first.offset) < (first.text.length + maxSeparationOfConsecutiveImports))
+      } yield {
+        PositionError(second.offset)
       }
     }
   }
