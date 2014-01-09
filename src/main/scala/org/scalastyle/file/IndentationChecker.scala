@@ -22,21 +22,29 @@ import org.scalastyle.Line
 import org.scalastyle.Lines
 import org.scalastyle.ScalastyleError
 
-class IndentationChecker extends FileChecker {
-  val DefaultTabSize = 2
-  val errorKey = "indentation"
+object NormalizedLine {
+  def normalize(lines: Lines, tabSize: Int) =
+    lines.lines.zipWithIndex map {
+      case (line, index) => NormalizedLine(index + 1, line, tabSize)
+    }
+}
 
+case class NormalizedLine(lineNumber: Int, line: Line, tabSize: Int) {
+  lazy val normalizedText = replaceTabs(line.text, tabSize)
+  lazy val length = normalizedText.length
+  lazy val body = normalizedText dropWhile { _.isWhitespace }
+  lazy val isBlank = { body.length == 0 }
+  lazy val indentDepth = normalizedText prefixLength { _ == ' ' }
+
+  def mkError(args: List[String] = Nil) = LineError(lineNumber, args)
+
+  // generates a string of spaces equal to the width of the tab
   private def spaces(column: Int, tabSize: Int): String = {
     val m = column % tabSize
-    val length = if (m == 0) {
-      tabSize
-    } else {
-      tabSize - m
-    }
-
-    String.format("%" + length + "s", " ")
+    String.format("%" + (tabSize - m) + "s", " ")
   }
 
+  // replaces tabs with spaces equal to the width of the tab
   private def replaceTabs(s: String, tabSize: Int): String = {
     val sb = new StringBuilder(s)
     val len = sb.length
@@ -55,37 +63,33 @@ class IndentationChecker extends FileChecker {
 
     sb.toString
   }
+}
 
-  private def isExempt(line1: Line, line2: Line) =
-    line1.text.matches(""".*class.*\([^\)]*""")
+class IndentationChecker extends FileChecker {
+  val DefaultTabSize = 2
+  val errorKey = "indentation"
+
+  private def multiLineComment(line: NormalizedLine) = line.body.startsWith("*")
+
+  private def startsParamList(line: NormalizedLine) = line.body.matches(""".*class.*\([^\)]*""")
+
+  // in multiline comments the last leading space is not part of the indent
+  private def isTabAlligned(line: NormalizedLine): Boolean =
+    (line.indentDepth % line.tabSize) == (if (multiLineComment(line)) 1 else 0)
+
+  private def isSingleIndent(line: NormalizedLine, prior: NormalizedLine): Boolean =
+    (line.indentDepth - prior.indentDepth) > line.tabSize
+
+  private def verifyTabStop(lines: Seq[NormalizedLine]) =
+    for { line <- lines if !isTabAlligned(line) } yield line.mkError()
+
+  private def verifySingleIndent(lines: Seq[NormalizedLine]) =
+    for { Seq(l1, l2) <- lines.sliding(2) if isSingleIndent(l2, l1) && !startsParamList(l1) } yield l2.mkError()
 
   def verify(lines: Lines): List[ScalastyleError] = {
     val tabSize = getInt("tabSize", DefaultTabSize)
 
-    val lineIndents = for {
-      (line, index) <- lines.lines.zipWithIndex
-      if line.text.matches(""".*\S.*""") // ignore blank lines
-      val normalizedLine = replaceTabs(line.text, tabSize)
-      val whitespaceLength = normalizedLine.prefixLength { _ == ' ' }
-      val multiLineComment = normalizedLine(whitespaceLength) == '*'
-      val indent = (whitespaceLength - (if (multiLineComment) 1 else 0))
-    } yield (index, indent)
-
-    val tabstopErrors = for {
-      (index, indent) <- lineIndents
-      if indent % tabSize != 0
-    } yield {
-      LineError(index + 1)
-    }
-
-    val extraIndentErrors = for {
-      Array((index1, indent1), (index2, indent2)) <- lineIndents.sliding(2)
-      if (indent2 - indent1) > tabSize
-      if !isExempt(lines.lines(index1), lines.lines(index2))
-    } yield {
-      LineError(index2 + 1)
-    }
-
-    (tabstopErrors ++ extraIndentErrors).toList
+    val normalizedLines = NormalizedLine.normalize(lines, tabSize) filterNot { _.isBlank }
+    (verifyTabStop(normalizedLines) ++ verifySingleIndent(normalizedLines)).toList
   }
 }
